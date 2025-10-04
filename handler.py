@@ -29,6 +29,10 @@ def generate_video(input_params):
     # ✅ Build the command for Step-Video-TI2V
     cmd = [sys.executable, "run_single.py", "--prompt", prompt, "--output_file_name", output_name]
 
+    # ⚙️ Add image if provided
+    if img_path:
+        cmd += ["--first_image_path", img_path]
+
     # ✅ Run the model
     try:
         result = subprocess.run(cmd, text=True, capture_output=True, check=True)
@@ -37,6 +41,11 @@ def generate_video(input_params):
         return {"error": str(e), "logs": e.stderr}
 
     # ✅ Return generated video info
-    return {"video_path": output_name, "logs": logs, "prompt": prompt, "input_image": image_url}
+    return {
+        "video_path": output_name,
+        "logs": logs,
+        "prompt": prompt,
+        "input_image": image_url if image_url else None
+    }
 
 runpod.serverless.start({"handler": generate_video})
