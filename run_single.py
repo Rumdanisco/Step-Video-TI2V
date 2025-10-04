@@ -1,24 +1,32 @@
 import torch
 from stepvideo.diffusion.video_pipeline import StepVideoPipeline
-from stepvideo.config import parse_args
 from stepvideo.utils import setup_seed
+from stepvideo.config import parse_args
+import os
 
-if __name__ == "__main__":
+
+def main():
     args = parse_args()
-
-    print("✅ Step-Video running in single-GPU mode (no distributed init).")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     setup_seed(args.seed)
 
-    # Load model
-    pipeline = StepVideoPipeline.from_pretrained(
-        args.model_dir
-    ).to(dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32, device=device)
+    # 🧠 Load model from Hugging Face
+    model_repo = os.getenv("MODEL_REPO", "user_or_org/Step-Video-TI2V-base")
+    token = os.getenv("HF_TOKEN", None)
 
-    pipeline.setup_pipeline(args)
+    print(f"🚀 Loading Step-Video-TI2V from {model_repo}")
+
+    pipeline = StepVideoPipeline.from_pretrained(
+        model_repo,
+        torch_dtype=torch.bfloat16,
+        token=token
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipeline = pipeline.to(device)
 
     prompt = args.prompt
+
+    print(f"🎬 Generating video for prompt: {prompt}")
 
     videos = pipeline(
         prompt=prompt,
@@ -31,8 +39,13 @@ if __name__ == "__main__":
         time_shift=args.time_shift,
         pos_magic=args.pos_magic,
         neg_magic=args.neg_magic,
-        output_file_name=args.output_file_name or prompt[:50],
+        output_file_name=args.output_file_name or args.prompt[:50],
         motion_score=args.motion_score,
     )
 
-    print(f"✅ Video generation complete: {args.output_file_name or prompt[:50]}")
+    print("✅ Generation complete.")
+    return videos
+
+
+if __name__ == "__main__":
+    main()
