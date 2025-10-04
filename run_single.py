@@ -10,22 +10,22 @@ def main():
     setup_seed(args.seed)
 
     # 🧠 Load model from Hugging Face
-    model_repo = os.getenv("MODEL_REPO", "user_or_org/Step-Video-TI2V-base")
-    token = os.getenv("HF_TOKEN", None)
+    model_repo = os.getenv("MODEL_REPO", "stepfun-ai/Step-Video-TI2V")
+    token = os.getenv("HUGGINGFACE_TOKEN", None)
 
-    print(f"🚀 Loading Step-Video-TI2V from {model_repo}")
+    print(f"🚀 Loading Step-Video-TI2V model from: {model_repo}")
 
+    # ✅ Correct keyword: use_auth_token (not token)
     pipeline = StepVideoPipeline.from_pretrained(
         model_repo,
-        torch_dtype=torch.bfloat16,
-        token=token
+        torch_dtype=torch.float16,
+        use_auth_token=token
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pipeline = pipeline.to(device)
 
     prompt = args.prompt
-
     print(f"🎬 Generating video for prompt: {prompt}")
 
     videos = pipeline(
