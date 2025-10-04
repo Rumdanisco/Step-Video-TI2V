@@ -27,9 +27,7 @@ def generate_video(input_params):
             return {"error": f"Failed to download image: {str(e)}"}
 
     # ✅ Build the command for Step-Video-TI2V
-    cmd = [sys.executable, "run_parallel.py", "--prompt", prompt, "--output_file_name", output_name]
-    if img_path:
-        cmd += ["--input_image", img_path]
+    cmd = [sys.executable, "run_single.py", "--prompt", prompt, "--output_file_name", output_name]
 
     # ✅ Run the model
     try:
