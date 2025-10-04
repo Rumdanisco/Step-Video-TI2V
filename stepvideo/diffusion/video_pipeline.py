@@ -1,429 +1,240 @@
-# Copyright 2025 StepFun Inc. All Rights Reserved.
+# stepvideo/diffusion/video_pipeline.py
+"""
+StepVideoPipeline — lightweight wrapper that loads the full Step-Video pipeline
+from Hugging Face and exposes a small, stable interface for local inference.
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+This wrapper delegates to a HF DiffusionPipeline (downloaded via `from_pretrained`),
+so you don't need separate VAE/caption microservices.
+Environment variables:
+ - HF_TOKEN      : (optional) Hugging Face token used for private repos
+ - MODEL_REPO    : (optional) Hugging Face repo id (e.g. "stepfun-ai/Step-Video-TI2V")
+"""
+
+from typing import Any, List, Optional, Union
 from dataclasses import dataclass
-
-import numpy as np
-import pickle
-import torch
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.utils import BaseOutput
-import asyncio
-
-from stepvideo.modules.model import StepVideoModel
-from stepvideo.diffusion.scheduler import FlowMatchDiscreteScheduler
-from stepvideo.utils import VideoProcessor
-from torchvision import transforms
-from PIL import Image as PILImage
-
 import os
-
-
-def call_api_gen(url, api, port=8080):
-    url =f"http://{url}:{port}/{api}-api"
-    import aiohttp
-    async def _fn(samples, *args, **kwargs):
-        if api=='vae':
-            data = {
-                    "samples": samples,
-                }
-        elif api=='vae-encode':
-            data = {
-                    "videos": samples,
-                }
-        elif api == 'caption':
-            data = {
-                    "prompts": samples,
-                }
-        else:
-            raise Exception(f"Not supported api: {api}...")
-        
-        async with aiohttp.ClientSession() as sess:
-            data_bytes = pickle.dumps(data)
-            async with sess.get(url, data=data_bytes, timeout=12000) as response:
-                result = bytearray()
-                while not response.content.at_eof():
-                    chunk = await response.content.read(1024)
-                    result += chunk
-                response_data = pickle.loads(result)
-        return response_data
-        
-    return _fn
-
-
-
+import torch
+from diffusers.utils import BaseOutput
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+import numpy as np
 
 @dataclass
 class StepVideoPipelineOutput(BaseOutput):
     video: Union[torch.Tensor, np.ndarray]
-    
 
-class StepVideoPipeline(DiffusionPipeline):
-    r"""
-    Pipeline for text-to-video generation using StepVideo.
+class StepVideoPipeline:
+    """
+    Wrapper around a Hugging Face DiffusionPipeline for Step-Video style generation.
 
-    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
-    implemented for all pipelines (downloading, saving, running on a particular device, etc.).
-
-    Args:
-        transformer ([`StepVideoModel`]):
-            Conditional Transformer to denoise the encoded image latents.
-        scheduler ([`FlowMatchDiscreteScheduler`]):
-            A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
-        vae_url:
-            remote vae server's url.
-        caption_url:
-            remote caption (stepllm and clip) server's url.
+    Usage:
+        pipe = StepVideoPipeline(model_id="Wan-AI/Wan2.2-I2V-A8B")
+        pipe.setup_device("cuda")           # optional, defaults to cuda if available
+        out = pipe(prompt="...", first_image="img.png", num_frames=80, ...)
     """
 
-    def __init__(
-        self,
-        transformer: StepVideoModel,
-        scheduler: FlowMatchDiscreteScheduler,
-        vae_url: str = '127.0.0.1',
-        caption_url: str = '127.0.0.1',
-        save_path: str = './results',
-        name_suffix: str = '',
-    ):
-        super().__init__()
+    def __init__(self, model_id: Optional[str] = None, dtype: Optional[torch.dtype] = None):
+        model_id = model_id or os.environ.get("MODEL_REPO", "stepfun-ai/Step-Video-TI2V")
+        hf_token = os.environ.get("HF_TOKEN", None)
 
-        self.register_modules(
-            transformer=transformer,
-            scheduler=scheduler,
-        )
-        
-        self.vae_scale_factor_temporal = self.vae.temporal_compression_ratio if getattr(self, "vae", None) else 8
-        self.vae_scale_factor_spatial = self.vae.spatial_compression_ratio if getattr(self, "vae", None) else 16
-        self.video_processor = VideoProcessor(save_path, name_suffix)
-        
-        self.vae_url = vae_url
-        self.caption_url = caption_url
-        self.setup_api(self.vae_url, self.caption_url)
-    
-    def setup_pipeline(self, args):
-        self.args = args
-        self.video_processor = VideoProcessor(self.args.save_path, self.args.name_suffix)
-        self.setup_api(args.vae_url, args.caption_url)
-        return self
+        # Choose dtype (bfloat16 is recommended when supported)
+        self.dtype = dtype or (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else torch.float32)
 
-    def setup_api(self, vae_url, caption_url):
-        self.vae_url = vae_url
-        self.caption_url = caption_url
-        self.caption = call_api_gen(caption_url, 'caption')
-        self.vae = call_api_gen(vae_url, 'vae')
-        self.vae_encode = call_api_gen(vae_url, 'vae-encode')
-        return self
-    
-    def encode_prompt(
-        self,
-        prompt: str,
-        neg_magic: str = '',
-        pos_magic: str = '',
-    ):
-        device = self._execution_device
-        prompts = [prompt+pos_magic]
-        bs = len(prompts)
-        prompts += [neg_magic]*bs
-        
-        data = asyncio.run(self.caption(prompts))
-        prompt_embeds, prompt_attention_mask, clip_embedding = data['y'].to(device), data['y_mask'].to(device), data['clip_embedding'].to(device)
-
-        return prompt_embeds, clip_embedding, prompt_attention_mask
-
-    def decode_vae(self, samples):
-        samples = asyncio.run(self.vae(samples.cpu()))
-        return samples
-
-    def encode_vae(self, img):
-        latents = asyncio.run(self.vae_encode(img))
-        return latents
-
-    def check_inputs(self, num_frames, width, height):
-        num_frames = max(num_frames//17*17, 1)
-        width = max(width//16*16, 16)
-        height = max(height//16*16, 16)
-        return num_frames, width, height
-
-    def prepare_latents(
-        self,
-        batch_size: int,
-        num_channels_latents: 64,
-        height: int = 544,
-        width: int = 992,
-        num_frames: int = 204,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if latents is not None:
-            return latents.to(device=device, dtype=dtype)
-
-        num_frames, width, height = self.check_inputs(num_frames, width, height)
-        shape = (
-            batch_size,
-            max(num_frames//17*3, 1),
-            num_channels_latents,
-            int(height) // self.vae_scale_factor_spatial,
-            int(width) // self.vae_scale_factor_spatial,
-        )   # b,f,c,h,w
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+        print(f"[StepVideoPipeline] Loading model from: {model_id} (dtype={self.dtype})")
+        # Use `from_pretrained` to download/load the whole pipeline (transformer, vae, tokenizer, etc.)
+        # `use_auth_token` or `token` arg usage differs between versions; HF accepts token= as well.
+        kwargs = {}
+        if hf_token:
+            kwargs["token"] = hf_token  # huggingface_hub newer versions
+        # Some diffusers versions accept use_auth_token; provide it as fallback
+        try:
+            self.pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=self.dtype,
+                **kwargs
+            )
+        except TypeError:
+            # fallback for older diffusers versions
+            self.pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=self.dtype,
+                use_auth_token=hf_token if hf_token else None
             )
 
-        if generator is None:
-            generator = torch.Generator(device=self._execution_device)
+        # Default device assignment (pipe.to(...) below or call setup_device)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            self.pipe.to(self.device)
+        except Exception as e:
+            print(f"[StepVideoPipeline] Warning moving pipeline to device failed: {e}")
 
-        latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        # Expose commonly-used components if present
+        self.transformer = getattr(self.pipe, "transformer", None)
+        self.vae = getattr(self.pipe, "vae", None)
+        self.scheduler = getattr(self.pipe, "scheduler", None)
+        self.tokenizer = getattr(self.pipe, "tokenizer", None)
+        self.text_encoder = getattr(self.pipe, "text_encoder", None)
+
+        # video processor / saving
+        self.save_path = "./results"
+        self.name_suffix = ""
+
+    def setup_pipeline(self, args):
+        """Optional compatibility with existing code that calls setup_pipeline(args)."""
+        # map a couple common args to wrapper state
+        self.save_path = getattr(args, "save_path", self.save_path)
+        self.name_suffix = getattr(args, "name_suffix", self.name_suffix)
+        return self
+
+    def setup_device(self, device: Union[str, torch.device]):
+        """Move internal pipeline to a given device (e.g. 'cuda:0')."""
+        self.device = torch.device(device)
+        self.pipe.to(self.device)
+        return self
+
+    def encode_prompt(self, prompt: str, neg_magic: str = "", pos_magic: str = ""):
+        """
+        Encode prompt into embeddings. Tries to use the pipeline's tokenizer & text_encoder
+        if present; otherwise falls back to pipe._encode_prompt if available.
+        Returns (prompt_embeds, clip_embedding_or_none, attention_mask_or_none)
+        """
+        if hasattr(self.pipe, "_encode_prompt"):
+            # some pipelines provide internal helper
+            out = self.pipe._encode_prompt(prompt, device=self.device)
+            # _encode_prompt implementations vary; try to standardize
+            prompt_embeds = out if isinstance(out, torch.Tensor) else out.get("prompt_embeds", out)
+            return prompt_embeds, None, None
+
+        if self.tokenizer is not None and self.text_encoder is not None:
+            tok = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            with torch.no_grad():
+                enc = self.text_encoder(**tok)
+                # many encoders return last_hidden_state
+                prompt_embeds = getattr(enc, "last_hidden_state", enc)
+            return prompt_embeds, None, tok.get("attention_mask", None)
+
+        raise RuntimeError("No method to encode prompt found in pipeline (tokenizer/text_encoder/_encode_prompt missing).")
+
+    def decode_vae(self, latents: torch.Tensor):
+        """
+        Decode latents into pixel/video tensor. Tries common VAE APIs with safe fallbacks.
+        """
+        if self.vae is None:
+            # If the pipeline provides a direct helper, use it
+            if hasattr(self.pipe, "decode_latents"):
+                return self.pipe.decode_latents(latents)
+            return latents
+
+        # common methods: vae.decode, vae.decode_latents, vae.forward
+        if hasattr(self.vae, "decode"):
+            try:
+                return self.vae.decode(latents)
+            except Exception:
+                pass
+        if hasattr(self.vae, "decode_latents"):
+            return self.vae.decode_latents(latents)
+        # fallback: return latents
         return latents
 
-    
-    def resize_to_desired_aspect_ratio(self, video, aspect_size):
-        ## video is in shape [f, c, h, w]
-        height, width = video.shape[-2:]
-        
-        aspect_ratio = [w/h for h, w in aspect_size]
-        # # resize
-        aspect_ratio_fact = width / height
-        bucket_idx = np.argmin(np.abs(aspect_ratio_fact - np.array(aspect_ratio)))
-        aspect_ratio = aspect_ratio[bucket_idx]
-        target_size_height, target_size_width = aspect_size[bucket_idx]
-        
-        if aspect_ratio_fact < aspect_ratio:
-            scale = target_size_width / width
-        else:
-            scale = target_size_height / height
-
-        width_scale = int(round(width * scale))
-        height_scale = int(round(height * scale))
-
-
-        # # crop
-        delta_h = height_scale - target_size_height
-        delta_w = width_scale - target_size_width
-        assert delta_w>=0
-        assert delta_h>=0
-        assert not all(
-            [delta_h, delta_w]
-        )  
-        top = delta_h//2
-        left = delta_w//2
-
-        ## resize image and crop
-        resize_crop_transform = transforms.Compose([
-            transforms.Resize((height_scale, width_scale)),
-            lambda x: transforms.functional.crop(x, top, left, target_size_height, target_size_width),
-        ])
-
-        video = torch.stack([resize_crop_transform(frame.contiguous()) for frame in video], dim=0)
-        return video
-
-
-    def prepare_condition_hidden_states(
-        self, 
-        img: Union[str, PILImage.Image, torch.Tensor]=None, 
-        batch_size: int = 1,
-        num_channels_latents: int = 64,
-        height: int = 544,
-        width: int = 992,
-        num_frames: int = 204,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None
-    ):
-        if isinstance(img, str):
-            assert os.path.exists(img)
-            img = PILImage.open(img) 
-        
-        if isinstance(img, PILImage.Image):
-            img_tensor = transforms.ToTensor()(img.convert('RGB'))*2-1
-        else:
-            img_tensor = img
-            
-        num_frames, width, height = self.check_inputs(num_frames, width, height)
-            
-        img_tensor = self.resize_to_desired_aspect_ratio(img_tensor[None], aspect_size=[(height, width)])[None]
-
-        img_emb = self.encode_vae(img_tensor).repeat(batch_size, 1,1,1,1).to(device)
-        
-        padding_tensor = torch.zeros((batch_size, max(num_frames//17*3, 1)-1, num_channels_latents, int(height) // self.vae_scale_factor_spatial, int(width) // self.vae_scale_factor_spatial,), device=device)
-        condition_hidden_states = torch.cat([img_emb, padding_tensor], dim=1) 
-
-        condition_hidden_states = condition_hidden_states.repeat(2, 1,1,1,1) ## for CFG
-        return condition_hidden_states.to(dtype)
-
-    @torch.inference_mode()
-    def __call__(
-        self,
-        prompt: Union[str, List[str]] = None,
-        height: int = 544,
-        width: int = 992,
-        num_frames: int = 102,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 9.0,
-        time_shift: float = 13.0,
-        neg_magic: str = "",
-        pos_magic: str = "",
-        num_videos_per_prompt: Optional[int] = 1,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        first_image: Union[str, PILImage.Image, torch.Tensor] = None,
-        motion_score: float = 2.0,
-        output_type: Optional[str] = "mp4",
-        output_file_name: Optional[str] = "",
-        return_dict: bool = True,
-    ):
-        r"""
-        The call function to the pipeline for generation.
-
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-                instead.
-            height (`int`, defaults to `544`):
-                The height in pixels of the generated image.
-            width (`int`, defaults to `992`):
-                The width in pixels of the generated image.
-            num_frames (`int`, defaults to `204`):
-                The number of frames in the generated video.
-            num_inference_steps (`int`, defaults to `50`):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
-            guidance_scale (`float`, defaults to `9.0`):
-                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
-                usually at the expense of lower image quality. 
-            num_videos_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
-                generation deterministic.
-            latents (`torch.Tensor`, *optional*):
-                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor is generated by sampling using the supplied random `generator`.
-            first_image (`str`, `PIL.Image`, `torch.Tensor`):
-                A path for the reference image
-            output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
-            output_file_name(`str`, *optional*`):
-                The output mp4 file name.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`StepVideoPipelineOutput`] instead of a plain tuple.
-
-        Examples:
-
-        Returns:
-            [`~StepVideoPipelineOutput`] or `tuple`:
-                If `return_dict` is `True`, [`StepVideoPipelineOutput`] is returned, otherwise a `tuple` is returned
-                where the first element is a list with the generated images and the second element is a list of `bool`s
-                indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
+    def encode_vae(self, image: Union[str, torch.Tensor, Any]):
         """
+        Encode image/frame(s) into VAE latents. Tries common VAE APIs.
+        Accepts file path or tensor.
+        """
+        if self.vae is None:
+            raise RuntimeError("VAE not available on loaded pipeline.")
 
-        # 1. Check inputs. Raise error if not correct
-        device = self._execution_device
-
-        # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
-        do_classifier_free_guidance = guidance_scale > 1.0
-
-        # 3. Encode input prompt
-        prompt_embeds, prompt_embeds_2, prompt_attention_mask = self.encode_prompt(
-            prompt=prompt,
-            neg_magic=neg_magic,
-            pos_magic=pos_magic,
-        )
-
-        transformer_dtype = self.transformer.dtype
-        prompt_embeds = prompt_embeds.to(transformer_dtype)
-        prompt_attention_mask = prompt_attention_mask.to(transformer_dtype)
-        prompt_embeds_2 = prompt_embeds_2.to(transformer_dtype)
-
-        # 4. Prepare timesteps
-        self.scheduler.set_timesteps(
-            num_inference_steps=num_inference_steps,
-            time_shift=time_shift,
-            device=device
-        )
-
-        # 5. Prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            torch.bfloat16,
-            device,
-            generator,
-            latents,
-        )
-        condition_hidden_states = self.prepare_condition_hidden_states(
-            first_image, 
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            dtype=torch.bfloat16,
-            device=device)
-
-        # 7. Denoising loop
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(self.scheduler.timesteps):
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = latent_model_input.to(transformer_dtype)
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0]).to(latent_model_input.dtype)
-
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
-                    encoder_hidden_states_2=prompt_embeds_2,
-                    condition_hidden_states=condition_hidden_states,
-                    motion_score=motion_score,
-                    return_dict=False,
-                )
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(
-                    model_output=noise_pred,
-                    timestep=t,
-                    sample=latents
-                )
-                
-                progress_bar.update()
-
-        if not torch.distributed.is_initialized() or int(torch.distributed.get_rank())==0:
-            if not output_type == "latent":
-                video = self.decode_vae(latents)
-                video = self.video_processor.postprocess_video(video, output_file_name=output_file_name, output_type=output_type)
+        if isinstance(image, str):
+            from PIL import Image
+            img = Image.open(image).convert("RGB")
+            preprocess = getattr(self.pipe, "preprocess", None)
+            if preprocess:
+                img = preprocess(img)
             else:
-                video = latents
+                import torchvision.transforms as T
+                img = T.ToTensor()(img).unsqueeze(0) * 2 - 1  # example normalization
+        else:
+            img = image
 
-            # Offload all models
-            self.maybe_free_model_hooks()
+        if hasattr(self.vae, "encode"):
+            return self.vae.encode(img)
+        if hasattr(self.vae, "encode_latents"):
+            return self.vae.encode_latents(img)
 
-            if not return_dict:
-                return (video, )
+        raise RuntimeError("VAE does not expose a known encode method.")
 
-            return StepVideoPipelineOutput(video=video)
-        
+    def __call__(self,
+                 prompt: Optional[str] = None,
+                 first_image: Optional[str] = None,
+                 num_frames: int = 81,
+                 height: int = 720,
+                 width: int = 1280,
+                 num_inference_steps: int = 50,
+                 guidance_scale: float = 7.5,
+                 time_shift: float = 13.0,
+                 pos_magic: str = "",
+                 neg_magic: str = "",
+                 motion_score: float = 2.0,
+                 output_type: str = "mp4",
+                 output_file_name: Optional[str] = None,
+                 return_dict: bool = True,
+                 **kwargs):
+        """
+        High-level generation call — delegates to the underlying pipeline if possible.
+        Keeps argument names compatible with earlier StepVideo usage.
+        """
+        # If underlying pipeline exposes a call() that accepts these args, call it.
+        pipe_call = getattr(self.pipe, "__call__", None)
+        if pipe_call is None:
+            raise RuntimeError("Underlying HF pipeline has no __call__ method.")
 
-        
+        # Helpful mapping — many HF pipelines accept similar arguments but not identical names.
+        call_kwargs = dict(
+            prompt=prompt,
+            first_image=first_image,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            time_shift=time_shift,
+            pos_magic=pos_magic,
+            neg_magic=neg_magic,
+            motion_score=motion_score,
+            output_type=output_type,
+            output_file_name=output_file_name,
+            return_dict=return_dict,
+        )
+        # pass other kwargs through
+        call_kwargs.update(kwargs)
+
+        # Call underlying pipeline (it may handle batching, VAE decode, etc.)
+        out = pipe_call(**{k: v for k, v in call_kwargs.items() if v is not None})
+        # Normalise returns: if pipeline returned a dataclass like StepVideoPipelineOutput, return .video
+        if hasattr(out, "video"):
+            return out.video
+        return out
+
+    # small convenience
+    def save_video(self, video_tensor: Union[torch.Tensor, np.ndarray], filename: str):
+        """If you need to save locally — use pipeline's utilities if available"""
+        # try to use pipe's utility if available
+        if hasattr(self.pipe, "save_video") and callable(self.pipe.save_video):
+            return self.pipe.save_video(video_tensor, filename)
+        # fallback naive saving using torchvision + imageio (simple 1-frame or sequence)
+        try:
+            import imageio
+            if isinstance(video_tensor, torch.Tensor):
+                v = video_tensor.detach().cpu().numpy()
+            else:
+                v = np.array(video_tensor)
+            # v expected shape [f, c, h, w] or [c, h, w]
+            if v.ndim == 4:
+                frames = [(np.clip(((frame + 1) * 127.5), 0, 255)).astype(np.uint8).transpose(1, 2, 0) for frame in v]
+            elif v.ndim == 3:
+                frames = [(np.clip(((v + 1) * 127.5), 0, 255)).astype(np.uint8).transpose(1, 2, 0)]
+            else:
+                raise RuntimeError("Unexpected video tensor shape for saving.")
+            imageio.mimwrite(filename, frames, fps=16)
+            return filename
+        except Exception as e:
+            raise RuntimeError(f"Saving video failed: {e}")
